@@ -1,32 +1,571 @@
-# Prerequisites
-*.d
+#include <amxmodx>
+#include <fakemeta>
+//#include <colorchat> // if using reklam (what can be enabled by REKLAM_TIME in config) - this line must be activated
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+// =============================== CONFIG START ===============================
+#define DISTANCE_BELOW 0.031250 // distance under ground on what you still can walk and do jb (total vertical available distance for jb is 2.0 units) [not suggesting to change this - it's just for information]
+#define REKLAM_TIME 0 // time in seconds for reklaming "say /jbtrainer to enable/disable..." (value lower or equal 0 - reklam off) (I'm suggesting to use this in case disabled connect enabler and with value about 180.0 [3 minutes]) (enable colorchat.inc if using this)
+#define MOD_NAME "[XJ]" // mod name when something is printed in chat
 
-# Precompiled Headers
-*.gch
-*.pch
+#define CONNECT_ENABLER // comment this to auto-disable jb trainer when client connects
+#define USE_CUSTOM_SOUND // comment this to use vox "ow my god" sound (vox may not sound so good as you think) (sound is played only on challenge 100% or harder)
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+// ================================ CONFIG END ================================
 
-# Fortran module files
-*.mod
-*.smod
+#define PLUGIN_NAME	"Jb Trainer"
+#define PLUGIN_VERSION	"1.5"
+#define PLUGIN_AUTHOR	"Numb"
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+#if !defined _colorchat_included
 
-# Executables
-*.exe
-*.out
-*.app
+/* part from colorchat.inc */
+
+enum
+{
+	proprint_console = 0,
+	proprint_center,
+	proprint_chat,
+};
+
+ProPrint(id, type, const msg[], {Float,Sql,Result,_}:...)
+{
+	if( id!=0 && !is_user_connected(id) )
+		return 0;
+	
+	new message[192];
+	vformat(message, 192, msg, 4);
+	
+	if( id==0 )
+	{
+		new players[32], num;
+		get_players(players, num);
+		for( new i; i<num; i++ )
+			engfunc(EngFunc_ClientPrintf, players[i], clamp(type, 0, 2), message);
+	}
+	else
+		engfunc(EngFunc_ClientPrintf, id, clamp(type, 0, 2), message);
+	
+	return 1;
+}
+
+#endif
+
+new g_iClientThinkNum[10][33];
+new g_iClientThinks[33];
+new bool:g_bJbStatsEnabled[33];
+new bool:g_bJbBelow[33];
+
+new g_iButton[33][2];
+new g_iKeyTiming[33][2];
+new bool:g_bInDmgFall[33];
+new Float:g_fHadChance[33];
+new Float:g_fUnhookableDistance;
+new bool:g_bUnkownCondition;
+
+new g_iOldButtons, g_iButtons;
+
+#if defined USE_CUSTOM_SOUND
+public plugin_precache()
+	precache_sound("misc/mod_excellent.wav");
+#endif
+
+public plugin_init()
+{
+	register_plugin(PLUGIN_NAME, PLUGIN_VERSION, PLUGIN_AUTHOR);
+	
+	register_clcmd("say /jb", "clcmd_jbtrainer", ADMIN_ALL, " - enables/disables jumpbug training statistics");
+	
+	register_forward(FM_PlayerPreThink,  "FM_PlayerPreThink_Pre",   0);
+	register_forward(FM_PlayerPostThink, "FM_PlayerPostThink_Post", 1);
+	
+#if REKLAM_TIME > 0
+	set_task(minfloat(float(REKLAM_TIME), 60.0), "plugin_reklam", 0, "", 0, "b");
+#endif
+}
+
+#if REKLAM_TIME > 0
+Float:minfloat(Float:Value, Float:MinAllowed)
+{
+	if( MinAllowed>=Value )
+		return MinAllowed;
+	
+	return Value;
+}
+
+public plugin_reklam()
+	ColorChat(0, TEAM_COLOR, "%s ^x01Type ^"^x04/jb^x01^" to enable/disable jumpbug training statistics.", MOD_NAME);
+#endif
+
+public client_putinserver(iPlrId)
+{
+#if defined CONNECT_ENABLER
+	g_bJbStatsEnabled[iPlrId] = true;
+#else
+	g_bJbStatsEnabled[iPlrId] = false;
+#endif
+	g_iClientThinks[iPlrId] = 0;
+	set_task(0.1, "set_client_tasks", (iPlrId*-1), "", 0, "a", 10);
+}
+
+public client_disconnect(iPlrId)
+{
+	if( task_exists((iPlrId*-1)) )
+		remove_task((iPlrId*-1));
+	
+	for( new iTemp=1; iTemp<11; iTemp++ )
+	{
+		if( task_exists((iPlrId*iTemp)) )
+			remove_task((iPlrId*iTemp));
+		else
+			break;
+	}
+}
+
+public set_client_tasks(iTaskId)
+{
+	new iParam[2], iPlrId = (iTaskId*-1);
+	iParam[0] = iPlrId;
+	for( new iTemp=1; iTemp<11; iTemp++ )
+	{
+		if( !task_exists((iPlrId*iTemp)) )
+		{
+			iParam[1] = (iTemp-1);
+			g_iClientThinkNum[iParam[1]][iPlrId] = 0;
+			set_task(1.0, "refresh_client_data", (iPlrId*iTemp), iParam, 2, "b");
+			break;
+		}
+	}
+}
+
+public clcmd_jbtrainer(iPlrId)
+{
+	if( g_bJbStatsEnabled[iPlrId] )
+		g_bJbStatsEnabled[iPlrId] = false;
+	else
+		g_bJbStatsEnabled[iPlrId] = true;
+	
+	client_print(iPlrId, print_chat, "%s Jump-Bug training statistics are now %sabled.", MOD_NAME, (g_bJbStatsEnabled[iPlrId]?"en":"dis"));
+	client_print(iPlrId, print_chat, "%s To %sable them back type ^"/jb^".", MOD_NAME, (g_bJbStatsEnabled[iPlrId]?"dis":"en"));
+}
+
+public refresh_client_data(iParam[2])
+{
+	g_iClientThinks[iParam[0]] = g_iClientThinkNum[iParam[1]][iParam[0]];
+	g_iClientThinkNum[iParam[1]][iParam[0]] = 0;
+	
+	static s_iPing, s_iUserChecks[33];
+	get_user_ping(iParam[0], s_iPing, s_iUserChecks[0]);
+	
+	if( s_iPing<=100 )
+		s_iUserChecks[iParam[0]] = 2;
+	else
+		s_iUserChecks[iParam[0]]++;
+	
+	if( s_iUserChecks[iParam[0]]<2 ) // if use has ping higher than 100 we are showing statistics two times slower cuz we dont want him to lag like hell
+		return;
+	else
+		s_iUserChecks[iParam[0]] = 0;
+	
+	if( is_user_alive(iParam[0]) )
+		show_data(iParam[0], iParam[0]);
+	else if( is_specmode_valid(pev(iParam[0], pev_iuser1)) )
+		show_data(iParam[0], pev(iParam[0], pev_iuser2));
+}
+
+show_data(iSpectator, iJumpBugger)
+{
+	static Float:s_fVelocity[3];
+	pev(iJumpBugger, pev_velocity, s_fVelocity);
+	
+	s_fVelocity[2] *= -1.0;
+		
+	if( g_bJbStatsEnabled[iSpectator] && g_bInDmgFall[iJumpBugger] && !is_user_bot(iSpectator) )
+	{
+		ProPrint(iSpectator, proprint_center, " ",
+			(200.0/(s_fVelocity[2]/float(g_iClientThinks[iJumpBugger]))), (s_fVelocity[2]/20.0), s_fVelocity[2], g_iClientThinks[iJumpBugger]);
+	}
+	
+	return 1;
+}
+
+is_specmode_valid(iSpecMode)
+	return ( iSpecMode==1 || iSpecMode==2 || iSpecMode==4 ) // || iSpecMode==6 );
+
+/*
+message_begin(MSG_ONE, get_user_msgid("TextMsg"), {0,0,0}, iPlrId);
+write_byte(print_center);
+write_string("#Spec_Mode1"); // "Locked Chase Camera" iuser1 = 1
+write_string("#Spec_Mode2"); // "Free Chase Camera"   iuser1 = 2
+write_string("#Spec_Mode3"); // "Free Look"           iuser1 = 3
+write_string("#Spec_Mode4"); // "First Person"        iuser1 = 4
+write_string("#Spec_Mode5"); // "Free Map OverView"   iuser1 = 5
+write_string("#Spec_Mode6"); // "Chase Map Overview"  iuser1 = 6
+message_end()
+*/
+
+public FM_PlayerPreThink_Pre(iPlrId)
+{
+	g_iClientThinkNum[0][iPlrId]++;
+	g_iClientThinkNum[1][iPlrId]++;
+	g_iClientThinkNum[2][iPlrId]++;
+	g_iClientThinkNum[3][iPlrId]++;
+	g_iClientThinkNum[4][iPlrId]++;
+	g_iClientThinkNum[5][iPlrId]++;
+	g_iClientThinkNum[6][iPlrId]++;
+	g_iClientThinkNum[7][iPlrId]++;
+	g_iClientThinkNum[8][iPlrId]++;
+	g_iClientThinkNum[9][iPlrId]++;
+	
+	static Float:s_fClientOldSpeed[33];
+	
+	if( !is_user_alive(iPlrId) || pev(iPlrId, pev_flags)&FL_ONGROUND || pev(iPlrId, pev_waterlevel)>=2 )
+	{
+		g_fHadChance[0] = s_fClientOldSpeed[iPlrId];
+		s_fClientOldSpeed[iPlrId] = 0.0;
+		
+		if( g_bInDmgFall[iPlrId] )
+			jb_failed(iPlrId, ((g_fHadChance[iPlrId]!=0.0)?false:true));
+		
+		g_iButton[iPlrId][0] = 0;
+		g_iButton[iPlrId][1] = 0;
+		
+		g_bInDmgFall[iPlrId] = false;
+		g_fHadChance[iPlrId] = 0.0;
+		
+		g_iKeyTiming[iPlrId][0] = 0;
+		g_iKeyTiming[iPlrId][1] = 0;
+		
+		return FMRES_IGNORED;
+	}
+	
+	g_iOldButtons = pev(iPlrId, pev_oldbuttons);
+	g_iButtons = pev(iPlrId, pev_button);
+	
+	if( g_iButton[iPlrId][0]<=0 )
+	{
+		if( g_iOldButtons&IN_DUCK && !(g_iButtons&IN_DUCK) )
+		{
+			g_iKeyTiming[iPlrId][0] = -1;
+			g_iButton[iPlrId][0] = 1;
+		}
+	}
+	if( g_iButton[iPlrId][0] )
+		g_iKeyTiming[iPlrId][0]++;
+	if( g_iButtons&IN_DUCK )
+		g_iButton[iPlrId][0] = -1;
+	
+	if( g_iButton[iPlrId][1]<=0 )
+	{
+		if( !(g_iOldButtons&IN_JUMP) && g_iButtons&IN_JUMP )
+		{
+			g_iKeyTiming[iPlrId][1] = -1;
+			g_iButton[iPlrId][1] = 1;
+		}
+	}
+	if( g_iButton[iPlrId][1] )
+		g_iKeyTiming[iPlrId][1]++;
+	if( !(g_iButtons&IN_JUMP) )
+		g_iButton[iPlrId][1] = -1;
+	
+	static Float:s_fVelocity[3];
+	pev(iPlrId, pev_velocity, s_fVelocity);
+	
+	if( s_fVelocity[2]<=-500.0 )
+	{
+		g_bInDmgFall[iPlrId] = true;
+		
+		if( pev(iPlrId, pev_flags)&FL_DUCKING )
+		{
+			static Float:s_fOrigin[3], Float:s_fOrigin2[3], Float:s_fUserOrigin[3];
+			pev(iPlrId, pev_origin, s_fOrigin);
+			s_fUserOrigin = s_fOrigin;
+			
+			g_fHadChance[0] = (36.0-2.0+DISTANCE_BELOW); //36.03125;
+			s_fOrigin2 = s_fOrigin;
+			s_fOrigin2[2] -= (g_fHadChance[0]*2.0);
+			engfunc(EngFunc_TraceLine, s_fOrigin, s_fOrigin2, DONT_IGNORE_MONSTERS, iPlrId, 0);
+			s_fOrigin2[2] += g_fHadChance[0];
+			get_tr2(0, TR_flFraction, s_fUserOrigin[0]);
+			if( s_fUserOrigin[0]<=0.5 )
+			{
+				get_tr2(0, TR_vecEndPos, s_fOrigin);
+				s_fOrigin[0] = (s_fOrigin[2]-s_fOrigin2[2]);
+				s_fOrigin[1] = (s_fOrigin2[2]-s_fOrigin[2]);
+				
+				if( s_fOrigin[0]<=(2.0-DISTANCE_BELOW) && s_fOrigin[0]>=0.0 )
+				{
+					g_bJbBelow[iPlrId] = false;
+					g_fHadChance[iPlrId] = s_fOrigin[0];
+					g_fHadChance[0] = (s_fVelocity[2]*-1.0);
+				}
+				else if( s_fOrigin[1]<=DISTANCE_BELOW && s_fOrigin[1]>=0.0 )
+				{
+					g_bJbBelow[iPlrId] = true;
+					g_fHadChance[iPlrId] = s_fOrigin[1];
+					g_fHadChance[0] = (s_fVelocity[2]*-1.0);
+				}
+				/*else
+				{
+					g_fHadChance[0] = s_fClientOldSpeed[iPlrId];
+					s_fClientOldSpeed[iPlrId] = 0.0;
+					
+					if( g_iButton[iPlrId][0] && g_iKeyTiming[iPlrId][0] )
+						g_iKeyTiming[iPlrId][0]--;
+					else
+						g_iButton[iPlrId][0] = 0;
+					
+					if( g_iButton[iPlrId][1] && g_iKeyTiming[iPlrId][1] )
+						g_iKeyTiming[iPlrId][1]--;
+					else
+						g_iButton[iPlrId][1] = 0;
+					
+					jb_failed(iPlrId, ((g_fHadChance[iPlrId]!=0.0)?false:true));
+					
+					g_bInDmgFall[iPlrId] = false;
+					g_fHadChance[iPlrId] = 0.0;
+					
+					g_iKeyTiming[iPlrId][0] = 0;
+					g_iKeyTiming[iPlrId][1] = 0;
+					
+					g_iButton[iPlrId][0] = 0;
+					g_iButton[iPlrId][1] = 0;
+					
+					return FMRES_IGNORED;
+				}*/
+			}
+			
+			if( g_fHadChance[iPlrId]==0.0 )
+			{
+				if( s_fUserOrigin[0]!=1.0 )
+				{
+					g_bUnkownCondition = false;
+					get_tr2(0, TR_vecEndPos, s_fOrigin);
+					g_fUnhookableDistance = (s_fUserOrigin[2]-s_fOrigin[2]-36.0);
+				}
+				else
+					g_bUnkownCondition = true;
+			}
+			else
+				g_bUnkownCondition = false;
+		}
+		
+		g_fHadChance[0] = s_fClientOldSpeed[iPlrId] = (s_fVelocity[2]*-1.0);
+	}
+	else
+	{
+		g_fHadChance[0] = s_fClientOldSpeed[iPlrId];
+		s_fClientOldSpeed[iPlrId] = 0.0;
+		
+		if( g_bInDmgFall[iPlrId] )
+		{
+			if( g_iButton[iPlrId][0] && g_iKeyTiming[iPlrId][0] )
+				g_iKeyTiming[iPlrId][0]--;
+			else
+				g_iButton[iPlrId][0] = 0;
+			
+			if( g_iButton[iPlrId][1] && g_iKeyTiming[iPlrId][1] )
+				g_iKeyTiming[iPlrId][1]--;
+			else
+				g_iButton[iPlrId][1] = 0;
+			
+			jb_failed(iPlrId, ((g_fHadChance[iPlrId]!=0.0)?false:true));
+		}
+		
+		g_bInDmgFall[iPlrId] = false;
+		g_fHadChance[iPlrId] = 0.0;
+		
+		g_iKeyTiming[iPlrId][0] = 0;
+		g_iKeyTiming[iPlrId][1] = 0;
+		
+		g_iButton[iPlrId][0] = 0;
+		g_iButton[iPlrId][1] = 0;
+	}
+	
+	return FMRES_IGNORED;
+}
+
+public FM_PlayerPostThink_Post(iPlrId)
+{
+	if( !g_bInDmgFall[iPlrId] || g_iOldButtons&IN_JUMP || !(g_iButtons&IN_JUMP) || !is_user_alive(iPlrId) )
+		return FMRES_IGNORED;
+	
+	g_iKeyTiming[iPlrId][1] = 0;
+	
+	if( g_iOldButtons&IN_DUCK && !g_iKeyTiming[iPlrId][0] )
+	{
+		if( !(pev(iPlrId, pev_flags)&FL_DUCKING) )
+		{
+			static Float:s_fVelocity[3];
+			pev(iPlrId, pev_velocity, s_fVelocity);
+			
+			if( s_fVelocity[2]>0.0 )
+			{
+				if( g_fHadChance[iPlrId]==0.0 )
+				{
+					g_fHadChance[iPlrId] = floatabs(g_fUnhookableDistance);
+					g_bJbBelow[iPlrId] = ((g_fUnhookableDistance<0.0)?true:false);
+				}
+				made_jb(iPlrId);
+			}
+		}
+	}
+	
+	return FMRES_IGNORED;
+}
+
+made_jb(iPlrId)
+{
+	new iPlayers[32], iPlayersNum, iConsoleMessage[5][128];
+	if( !g_bUnkownCondition )
+		formatex(iConsoleMessage[0], 128, "%f units %s the ground!", g_fHadChance[iPlrId], (g_bJbBelow[iPlrId]?"below":"above"));
+	else
+		copy(iConsoleMessage[0], 128, "with unknown condition!");
+	formatex(iConsoleMessage[1], 128, "Ability: %.2f", (200.0/(g_fHadChance[0]/float(g_iClientThinks[iPlrId]))));
+	formatex(iConsoleMessage[2], 128, "Challenge: %.2f", (g_fHadChance[0]/20.0));
+	formatex(iConsoleMessage[3], 128, "Fall Speed: %.2fu/s", g_fHadChance[0]);
+	formatex(iConsoleMessage[4], 128, "Engine: %ifps", g_iClientThinks[iPlrId]);
+	get_players(iPlayers, iPlayersNum, "bch");
+	iPlayers[iPlayersNum] = iPlrId;
+	iPlayersNum++;
+	set_hudmessage(255, 127, 0, -1.0, 0.45, 2, 0.5, 5.0, 0.01, 1.0, 3);
+	for( new iTemp; iTemp<iPlayersNum; iTemp++ )
+	{
+		if( !g_bJbStatsEnabled[iPlayers[iTemp]] )
+			continue;
+		
+		if( iPlrId!=iPlayers[iTemp] && (!is_specmode_valid(pev(iPlayers[iTemp], pev_iuser1)) || pev(iPlayers[iTemp], pev_iuser2)!=iPlrId) )
+			continue;
+		
+		show_hudmessage(iPlayers[iTemp], "Successful Jump-Bug was made^n%s^n%s%%^n%s%%^n%s^n%s", iConsoleMessage[0], iConsoleMessage[1], iConsoleMessage[2], iConsoleMessage[3], iConsoleMessage[4]);
+		ProPrint(iPlayers[iTemp], proprint_center, " ");
+		
+		//ProPrint(iPlayers[iTemp], proprint_center, "Successful Jump-Bug was made^n%s^nMore information in console", iConsoleMessage[0]);
+		console_print(iPlayers[iTemp], "%s", "Successful Jump-Bug was made");
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[0]);
+		console_print(iPlayers[iTemp], "%s%%%%", iConsoleMessage[1]);
+		console_print(iPlayers[iTemp], "%s%%%%", iConsoleMessage[2]);
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[3]);
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[4]);
+		console_print(iPlayers[iTemp], "");
+		
+		if( g_fHadChance[0]>=2000.0 )
+		{
+#if defined USE_CUSTOM_SOUND
+			client_cmd(iPlayers[iTemp], "spk misc/mod_excellent");
+#else
+			client_cmd(iPlayers[iTemp], "spk ^"vox/override(e15) micro(e30) got^"");
+#endif
+		}
+	}
+	
+	g_iButton[iPlrId][0] = 0;
+	g_iButton[iPlrId][1] = 0;
+	
+	g_bInDmgFall[iPlrId] = false;
+	g_fHadChance[iPlrId] = 0.0;
+	
+	g_iKeyTiming[iPlrId][0] = 0;
+	g_iKeyTiming[iPlrId][1] = 0;
+	
+	return 1;
+}
+
+jb_failed(iPlrId, bool:bImpossible=false)
+{
+	new iPlayers[32], iPlayersNum, iConsoleMessage[8][128];
+	if( g_fHadChance[iPlrId] )
+	{
+		formatex(iConsoleMessage[0], 128, "It could be done %f", g_fHadChance[iPlrId]);
+		formatex(iConsoleMessage[1], 128, "units %s the ground", (g_bJbBelow[iPlrId]?"below":"above"));
+	}
+	else
+	{
+		copy(iConsoleMessage[0], 128, "Jump-Bug was impossible to do this");
+		copy(iConsoleMessage[1], 128, "time or duck was released too early");
+	}
+	
+	if( g_iKeyTiming[iPlrId][0]==g_iKeyTiming[iPlrId][1] && g_iButton[iPlrId][0]==g_iButton[iPlrId][1] && g_iButton[iPlrId][0] )
+	{
+		if( g_fHadChance[iPlrId] && !g_iKeyTiming[iPlrId][0] )
+			copy(iConsoleMessage[2], 128, "Key mistake (first release duck and then jump but in one frame)");
+		else
+			formatex(iConsoleMessage[2], 128, "Possible perfect key combination but %s", g_fHadChance[iPlrId]?"bad ground timing":"impossible condition");
+		
+		if( g_fHadChance[iPlrId] )
+		{
+			if( g_iKeyTiming[iPlrId][0] )
+				formatex(iConsoleMessage[3], 128, "You tryed jb %d frames too early anyway", g_iKeyTiming[iPlrId][0]);
+			else
+				copy(iConsoleMessage[3], 128, "Ground timing is good");
+		}
+		else if( bImpossible )
+		{
+			if( g_iKeyTiming[iPlrId][0] )
+				formatex(iConsoleMessage[3], 128, "You tryed jb %d-%d frames too early anyway", (g_iKeyTiming[iPlrId][0]-1), g_iKeyTiming[iPlrId][0]);
+			else
+				copy(iConsoleMessage[3], 128, "Ground timing is good");
+		}
+		else if( g_iKeyTiming[iPlrId][0] )
+			formatex(iConsoleMessage[3], 128, "You tryed jb %d frames too early anyway", g_iKeyTiming[iPlrId][0]);
+		else
+			copy(iConsoleMessage[3], 128, "Ground timing is good");
+	}
+	else
+	{
+		if( g_iButton[iPlrId][0]>0 )
+		{
+			if( g_iKeyTiming[iPlrId][0] )
+				formatex(iConsoleMessage[2], 128, "Duck released %d frames too early", g_iKeyTiming[iPlrId][0]);
+			else
+				copy(iConsoleMessage[2], 128, "Duck released with perfect timing");
+		}
+		else
+			copy(iConsoleMessage[2], 128, "Duck was not released at all");
+		
+		if( g_iButton[iPlrId][1]>0 )
+		{
+			if( g_iKeyTiming[iPlrId][1] )
+				formatex(iConsoleMessage[3], 128, "Jump pressed %d frames too early", g_iKeyTiming[iPlrId][1]);
+			else
+				copy(iConsoleMessage[3], 128, "Jump pressed with perfect timing");
+		}
+		else
+			copy(iConsoleMessage[3], 128, "Jump was not pressed at all");
+	}
+	
+	formatex(iConsoleMessage[4], 128, "Ability: %.2f", (200.0/(g_fHadChance[0]/float(g_iClientThinks[iPlrId]))));
+	formatex(iConsoleMessage[5], 128, "Challenge: %.2f", (g_fHadChance[0]/20.0));
+	formatex(iConsoleMessage[6], 128, "Fall Speed: %.2fu/s", g_fHadChance[0]);
+	formatex(iConsoleMessage[7], 128, "Engine: %ifps", g_iClientThinks[iPlrId]);
+	get_players(iPlayers, iPlayersNum, "bch");
+	if( is_user_alive(iPlrId) )
+	{
+		iPlayers[iPlayersNum] = iPlrId;
+		iPlayersNum++;
+	}
+	set_hudmessage(255, 127, 127, -1.0, 0.45, 2, 0.5, 5.0, 0.01, 1.0, 3);
+	for( new iTemp; iTemp<iPlayersNum; iTemp++ )
+	{
+		if( !g_bJbStatsEnabled[iPlayers[iTemp]] )
+			continue;
+		
+		if( iPlrId!=iPlayers[iTemp] && (!is_specmode_valid(pev(iPlayers[iTemp], pev_iuser1)) || pev(iPlayers[iTemp], pev_iuser2)!=iPlrId) )
+			continue;
+		
+		show_hudmessage(iPlayers[iTemp], " ", iConsoleMessage[0], iConsoleMessage[1], iConsoleMessage[2], iConsoleMessage[3], iConsoleMessage[4], iConsoleMessage[5], iConsoleMessage[6], iConsoleMessage[7]);
+		ProPrint(iPlayers[iTemp], proprint_center, " ");
+		
+		//ProPrint(iPlayers[iTemp], proprint_center, "Jump-Bug Failed!^n%s^n%s^nMore information in console", iConsoleMessage[0], iConsoleMessage[1]);
+		console_print(iPlayers[iTemp], "%s", "Jump-Bug Failed!");
+		console_print(iPlayers[iTemp], "%s %s", iConsoleMessage[0], iConsoleMessage[1]);
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[2]);
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[3]);
+		console_print(iPlayers[iTemp], "%s%%%%", iConsoleMessage[4]);
+		console_print(iPlayers[iTemp], "%s%%%%", iConsoleMessage[5]);
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[6]);
+		console_print(iPlayers[iTemp], "%s", iConsoleMessage[7]);
+		console_print(iPlayers[iTemp], "");
+	}
+	
+	return 1;
+}
